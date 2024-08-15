@@ -10,9 +10,9 @@
 
 /* This example accompanies the book
    "Embedded Systems: Real Time Operating Systems for ARM Cortex M Microcontrollers",
-   ISBN: 978-1466468863, Jonathan Valvano, copyright (c) 2014
+   ISBN: 978-1466468863, Jonathan Valvano, copyright (c) 2015
 
- Copyright 2014 by Jonathan W. Valvano, valvano@mail.utexas.edu
+ Copyright 2015 by Jonathan W. Valvano, valvano@mail.utexas.edu
     You may use, edit, run or distribute this file
     as long as the above copyright notice remains
 
@@ -25,49 +25,161 @@
  http://users.ece.utexas.edu/~valvano/
  */
 
-// Implementation Notes:
-// This is a Knuth Heap. Each block has a header and a trailer, which I shall
-// call the meta-sections.  The meta-sections are each a single int32_t that tells
-// how many int32_ts/words can be stored between the header and trailer.
-// If the block is used, the meta-sections record the room as a positive
-// number.  If the block is unused, the meta-sections record the room as a
-// negative number.
+
 #include <stdint.h>
-#include "heap.h"
+#include <stdbool.h>
+#include <string.h>
+#include "../RTOS_Labs_common/heap.h"
+#include "../inc/CortexM.h"
 
-#define HEAP_START (Heap)
-#define HEAP_END (HEAP_START + HEAP_SIZE_WORDS)
+#define HEAP_NEW_SIZE 4096 // heap size in bytes
+#define HEAP_NEW_SIZE_WORDS HEAP_NEW_SIZE / 4
+#define HEAP_NEW_START Heap_new
+#define HEAP_NEW_END Heap_new + HEAP_NEW_SIZE_WORDS
+#define abs(x) (x > 0 ? x : -x)
+#define blockEnd(x) (x + abs(*x) + 1) 
 
-//The actual heap is just a big array.
-static int32_t Heap[HEAP_SIZE_WORDS];
+static int16_t Heap_new[HEAP_NEW_SIZE_WORDS];
 
-static int32_t inHeapRange(int32_t* address);
-static int32_t blockUsed(int32_t* block);
-static int32_t blockUnused(int32_t* block);
-static int32_t blockRoom(int32_t* block);
-//static int32_t blockSize(int32_t* block);
-static int32_t* blockHeader(int32_t* blockEnd);
-static int32_t* blockTrailer(int32_t* blockStart);
-static int32_t* nextBlockHeader(int32_t* blockStart);
-static int32_t* previousBlockHeader(int32_t* blockStart);
-static int32_t markBlockUsed(int32_t* blockStart);
-static int32_t markBlockUnused(int32_t* blockStart);
-static int32_t splitAndMarkBlockUsed(int32_t* upperBlockStart, int32_t desiredRoom);
-static void mergeBlockWithBelow(int32_t* upperBlockStart);
-//static int32_t byteIndex(int32_t* ptr);
+heap_stats_t stats_local;
+
+// the implementation is a basic malloc alforithm
+// the heap is divided into a series of blocks
+// at initialization, the entire heap is one block
+// for each block, the tag of either end is the size of the block
+// a positive value means the block is used, a negative value means the block is free
+// example heap
+
+// location - value
+// 0 - -6 - block tag
+// 1 - 0 ---
+// 2 - 0   |
+// 3 - 0   |
+// 4 - 0   | one free block 6 words wide
+// 5 - 0   |
+// 6 - 0 ---
+// 7 - -6 - block tag
+
+// now we allocate 3 words
+
+// 0 - 3 - block tag
+// 1 - 0 --
+// 2 - 0  | one allocated 3 word block
+// 3 - 0 --
+// 4 - 3 - block tag
+// 5 - -1   
+// 6 - 0   -- one free block 1 word wide
+// 7 - -1 
+
+// to traverse the heap all we need to do is check the first block (at Heap[0])
+// if it's free, split the block into a new allocated block and the remaining free space
+// if it's allocated, skip over the number of words specified by the tag and check the next block
+
+// this algorithm does result in fragmentation, thus if an allocation attempt fails
+// we must take an expensive defragmentation pass
+// this pass can either defragment the entire heap or just collect blocks until it reaches the neccessary size
+// and then shuffles memory around to make these free blocks contiguous and combine them into one larger free block
+
+void createBlock(int16_t* start, uint16_t size, bool allocated){
+  *start = allocated ? size : -size;
+  *blockEnd(start) = allocated ? size : -size;
+}
+
+void clearBlock(int16_t* start, uint16_t size){
+  memset(start + 1, 0, sizeof(int32_t) * size);
+}
+
+// splits the block with supplied new block size, does not check for size errors
+// returns the first block of the newly created pair
+int16_t* splitBlock(int16_t* blockStart, uint16_t size){
+  uint32_t currentBlockSize = abs(*blockStart);
+  if (currentBlockSize == size){
+    // same block size, allocate!
+    createBlock(blockStart, size, true);
+    return blockStart;
+  } else if (currentBlockSize > size + 2){ 
+    createBlock(blockStart, size, true);
+    createBlock(blockStart + size + 2, currentBlockSize - size - 2, false); // account for the extra 2 tags
+  } else if (currentBlockSize > size){
+    // not big enough to form a free block, just make the block the whole thing
+    createBlock(blockStart, currentBlockSize, true);
+    stats_local.free -= currentBlockSize - size + 1;
+    return blockStart;
+  }
+  stats_local.free -= 4;
+  return blockStart;
+
+}
+
+// returns the index of the head tag of the next block
+int16_t* nextBlock(int16_t* block){
+  
+  block = block + *block + 2; // skip over tag
+  if (block > HEAP_NEW_END){
+    block = HEAP_NEW_START;
+  }
+  return block;
+}
+
+// combines two contiguous free blocks
+int16_t* combineFreeBlocks(int16_t* block1, int16_t* block2){
+  stats_local.free += 4;
+	if (block1 < block2){
+		// block 1 on top
+		uint16_t newSize = abs(*block1) + abs(*block2) + 2; // account for removed tags
+		*block1 = -newSize;
+		*blockEnd(block2) = -newSize;
+		return block1;
+	} else {
+		// block 2 on top
+		int16_t newSize = abs(*block2) + abs(*block1) + 2; // account for removed tags
+		*block2 = -newSize;
+		*blockEnd(block1) = -newSize;
+		return block2;
+	}
+  
+}
+
+int16_t* freeBlock(int16_t* block){
+	uint16_t size = abs(*block);
+	*block = -size;
+	*(block + size + 1) = -size; 
+	
+  bool changed = true;
+  while (changed == true){
+    changed = false;
+    // try to combine with previous block
+    if (block != HEAP_NEW_START && *(block - 1) < 0){
+      // also free space, combine!
+      block = combineFreeBlocks(block, block - 2 - abs(*(block - 1)));
+      changed = true;
+      continue;
+    }
+    
+    // try to combine with next block
+    if (blockEnd(block) + 1 < HEAP_NEW_END && *(blockEnd(block) + 1) < 0){
+      block = combineFreeBlocks(block, blockEnd(block) + 1);
+      changed = true;
+      continue;
+    }
+  }
+  return block;
+}
 
 //******** Heap_Init *************** 
 // Initialize the Heap
 // input: none
-// output: always HEAP_OK
+// output: always 0
 // notes: Initializes/resets the heap to a clean state where no memory
 //  is allocated.
-int32_t Heap_Init(void){
-  int32_t* blockStart = HEAP_START;
-  int32_t* blockEnd = (HEAP_START + HEAP_SIZE_WORDS - 1);
-  *blockStart = -(int32_t)(HEAP_SIZE_WORDS - 2);  
-  *blockEnd = -(int32_t)(HEAP_SIZE_WORDS - 2);
-  return HEAP_OK;
+int Heap2_Init(void){
+  stats_local.size = HEAP_NEW_SIZE / 2- 4;
+  stats_local.used = 0;
+  stats_local.free = HEAP_NEW_SIZE / 2 - 4;
+
+  // create the first block
+  createBlock(HEAP_NEW_START, HEAP_NEW_SIZE_WORDS - 2, false);
+  return 0;
 }
 
 
@@ -77,24 +189,38 @@ int32_t Heap_Init(void){
 //   desiredBytes: desired number of bytes to allocate
 // output: void* pointing to the allocated memory or will return NULL
 //   if there isn't sufficient space to satisfy allocation request
-void* Heap_Malloc(int32_t desiredBytes){
-  int32_t desiredWords = (desiredBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
-  int32_t* blockStart = HEAP_START;  // implements first fit
-  if(desiredWords <= 0){
-    return 0; //NULL
+void* Heap2_Malloc(int32_t desiredBytes){
+  int16_t* currentBlock = HEAP_NEW_START;
+  
+  int16_t* out;
+  
+  if (stats_local.free < desiredBytes){ // check if we have enough space in HEAP
+    return NULL;
   }
-  while(inHeapRange(blockStart)){
-  // one pass through the heap
-  // choose first block that is big enough
-    if(blockUnused(blockStart) && desiredWords <= blockRoom(blockStart)){
-      if(splitAndMarkBlockUsed(blockStart, desiredWords)){
-        return 0; //NULL
+  
+  do{
+    if (*currentBlock < 0){
+      // found free block, check size
+      if (abs(*currentBlock) >= desiredBytes / 2 + (desiredBytes % 2 > 0 ? 1 : 0)){
+        // allocate!
+        splitBlock(currentBlock, desiredBytes / 2 + (desiredBytes % 2 > 0 ? 1 : 0));
+        out = currentBlock + 1;
+        break;
       }
-      return blockStart + 1;
     }
-    blockStart = nextBlockHeader(blockStart);
-  }
-  return 0; //NULL
+    currentBlock = nextBlock(currentBlock);
+  } while (currentBlock != HEAP_NEW_START);
+	
+	if (out == NULL){
+		// defrag, for now stop the OS
+		DisableInterrupts();
+		while (1) {}
+	}
+	
+	stats_local.free -= desiredBytes + (desiredBytes % 2 > 0 ? 1 : 0);
+	stats_local.used += desiredBytes + (desiredBytes % 2 > 0 ? 1 : 0);
+
+  return out;
 }
 
 
@@ -105,23 +231,41 @@ void* Heap_Malloc(int32_t desiredBytes){
 // output: void* pointing to the allocated memory block or will return NULL
 //   if there isn't sufficient space to satisfy allocation request
 //notes: the allocated memory block will be zeroed out
-void* Heap_Calloc(int32_t desiredBytes){  
-  int32_t* blockPtr;
-  int32_t wordsToClear;
-  int32_t i;
+void* Heap2_Calloc(int32_t desiredBytes){  
+	int16_t* currentBlock;
+  int16_t wordsToInitialize;
+  int16_t i;
   
-  //malloc a block
-  blockPtr = Heap_Malloc(desiredBytes);
-  //did malloc fail?
-  if(blockPtr == 0){
-    return 0; //NULL
+  // malloc a block of desiredBytes (testmain1 sets desiredBytes = 124)
+  currentBlock = Heap2_Malloc(desiredBytes);
+	
+  if(currentBlock == 0){ // check if malloc failed
+    return 0; // return NULL if malloc fails
   }
-  wordsToClear = *(blockPtr - 1); //get room from header
-  //clear out block
-  for(i = 0; i < wordsToClear; i++){
-    blockPtr[i] = 0;
-  }
-  return blockPtr;
+	
+	memset(currentBlock, 0, desiredBytes);
+	
+  return currentBlock; // return pointer to allocated memory block
+}
+
+//******** Heap_Free *************** 
+// return a block to the heap
+// input: pointer to memory to unallocate
+// output: 0 if everything is ok, non-zero in case of error (e.g. invalid pointer
+//     or trying to unallocate memory that has already been unallocated
+int Heap2_Free(void* pointer){
+	int16_t* ptr = ((int16_t*) pointer) - 1;
+	if (ptr < HEAP_NEW_START || ptr >= HEAP_NEW_END){
+		return 1;
+	}
+	
+	stats_local.free += abs(*ptr) * 2;
+	stats_local.used -= abs(*ptr) * 2;
+
+	freeBlock(ptr);
+	
+	return 0;
+	
 }
 
 
@@ -130,331 +274,71 @@ void* Heap_Calloc(int32_t desiredBytes){
 //input: 
 //  oldBlock: pointer to a block
 //  desiredBytes: a desired number of bytes for a new block
-//    where the contents of the old block will be copied to
 // output: void* pointing to the new block or will return NULL
 //   if there is any reason the reallocation can't be completed
-// notes: the given block will be unallocated after its contents
-//   are copied to the new block
-void* Heap_Realloc(void* oldBlock, int32_t desiredBytes){
-  int32_t* oldBlockPtr;
-  int32_t* oldBlockStart;
-  int32_t* newBlockPtr;
-  int32_t oldBlockRoom;
-  int32_t newBlockRoom;
-  int32_t wordsToCopy;
-  int32_t i;
-  
-  oldBlockPtr = (int32_t*) oldBlock;
-  // error if...
-  // 1) oldBlockPtr doesn't point in the heap
-  // 2) oldBlockPtr points to an unused block
-  oldBlockStart = oldBlockPtr - 1;
-  if(!inHeapRange(oldBlockStart) || blockUnused(oldBlockStart)){
-    return 0; // NULL
+// notes: the given block may be unallocated and its contents
+//   are copied to a new block if growing/shrinking not possible
+void* Heap2_Realloc(void* oldBlock, int32_t desiredBytes){
+  int16_t* block = (int16_t*) oldBlock; // copy of old block
+	int16_t* newBlockPtr;
+	int16_t wordsToCopy;
+	int16_t i;
+	
+  if (desiredBytes > abs(*block)){
+    // growing
+    if (desiredBytes > stats_local.free){ // reallocation bigger than amount of free heap space
+      // cannot grow
+      return 0;
+    } else {
+			newBlockPtr = Heap2_Malloc(desiredBytes); // allocate new block
+			
+			if(newBlockPtr == 0){ // check if malloc failed
+				return 0; // NULL
+			}
+			
+			wordsToCopy = *(block); // we are growing so we copy everything that was in oldBlock
+			for(i = 0; i < wordsToCopy; i++){
+					newBlockPtr[i] = block[i];
+			} // everything past will be unallocated space
+			
+			// unallocate given block
+			Heap2_Free(block);
+			return newBlockPtr; // return new block
+    }
+  } else {
+    // shrinking
+    if (desiredBytes == 0){
+      Heap2_Free(block);
+      return NULL;
+    } else {
+      // free contents past desiredBytes
+			newBlockPtr = Heap2_Malloc(desiredBytes); // allocate new block
+			if(newBlockPtr == 0){ // check if malloc failed
+				return 0; // NULL
+			}
+			wordsToCopy = *(newBlockPtr - 1);
+			for(i = 0; i < wordsToCopy; i++){
+				newBlockPtr[i] = block[i];
+			}
+			
+			// unallocate given block
+			Heap2_Free(block);
+			return newBlockPtr; // return new block
+    }
   }
-
-  newBlockPtr = Heap_Malloc(desiredBytes);
-  // did Malloc fail?
-  if(newBlockPtr == 0){
-    return 0; // NULL
-  }
-  
-  oldBlockRoom = blockRoom(oldBlockStart);
-  newBlockRoom = blockRoom(newBlockPtr - 1);
-  if(oldBlockRoom < newBlockRoom){
-    wordsToCopy = oldBlockRoom;
-  }
-  else{
-    wordsToCopy = newBlockRoom;
-  }  
-  for(i = 0; i < wordsToCopy; i++){
-    newBlockPtr[i] = oldBlockPtr[i];
-  }
-  if(Heap_Free(oldBlockPtr)){
-    return 0; // NULL Free failed
-  }
-  return newBlockPtr;
 }
 
 
-//******** Heap_Free *************** 
-// return a block to the heap
-// input: pointer to memory to unallocate
-// output: HEAP_OK if everything is ok;
-//  HEAP_ERROR_POINTER_OUT_OF_RANGE if pointer points outside the heap;
-//  HEAP_ERROR_CORRUPTED_HEAP if heap has been corrupted or trying to
-//  unallocate memory that has already been unallocated;
-int32_t Heap_Free(void* pointer){
-  int32_t* blockStart;
-  int32_t* blockEnd;
-  int32_t* nextBlockStart;
-  
-  blockStart = ((int32_t*)pointer) - 1;
 
-  //-----Begin error checking-------
-  if(!inHeapRange(blockStart)){
-    return HEAP_ERROR_POINTER_OUT_OF_RANGE;
-  }
-  if(blockUnused(blockStart)){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-  blockEnd = blockTrailer(blockStart);
-  if(!inHeapRange(blockEnd) || blockUnused(blockEnd)){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-  //-----End error checking-------
-
-  if(markBlockUnused(blockStart)){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-
-  // time to possibly merge with block above
-  // first, make sure there IS a block above us
-  if(blockStart > HEAP_START){ 
-    int32_t* previousBlockStart = previousBlockHeader(blockStart);
-    // second, make sure we only merge with an unused block
-    if(blockUnused(previousBlockStart)){
-      mergeBlockWithBelow(previousBlockStart);
-      blockStart = previousBlockStart; // start of block has moved
-    }
-  }
-
-  // possibly merge with block below
-  nextBlockStart = nextBlockHeader(blockStart);
-  if(inHeapRange(nextBlockStart) && blockUnused(nextBlockStart)){
-    mergeBlockWithBelow(blockStart);
-  }
-  return HEAP_OK;
-}
-
-
-//******** Heap_Test *************** 
-// Test the heap
-// input: none
-// output: validity of the heap - either HEAP_OK or HEAP_ERROR_HEAP_CORRUPTED
-int32_t Heap_Test(void){
-  int32_t lastBlockWasUnused = 0;
-  int32_t* blockStart = HEAP_START;
-  while(inHeapRange(blockStart)){
-    int32_t* blockEnd;
-    
-    //shouldn't have any blocks holding zero words
-    if(*blockStart == 0){
-      return HEAP_ERROR_CORRUPTED_HEAP;
-    }
-    blockEnd = blockTrailer(blockStart);
-    //error if blockEnd is not in the heap or blockend disagrees with blockStart
-    if(!inHeapRange(blockEnd) || *blockStart != *blockEnd){
-      return HEAP_ERROR_CORRUPTED_HEAP;
-    }
-    //error if we have two adjacent unused blocks
-    if(lastBlockWasUnused && blockUnused(blockStart)){
-      return HEAP_ERROR_CORRUPTED_HEAP;
-    }
-    lastBlockWasUnused = blockUnused(blockStart);
-    blockStart = blockEnd + 1;
-  }
-  //traversing the heap should end exactly where the heap ends
-  if(blockStart != HEAP_END){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-  return HEAP_OK;
-}
 
 
 //******** Heap_Stats *************** 
 // return the current status of the heap
-// input: none
-// output: a heap_stats_t that describes the current usage of the heap
-heap_stats2_t Heap_Stats(void){
-  int32_t* blockStart;
-  heap_stats2_t stats;
-  
-  stats.wordsAllocated = 0;
-  stats.wordsAvailable = 0;
-  stats.blocksUsed = 0;
-  stats.blocksUnused = 0;
-
-  //just go through each block to get stats on heap usage
-  blockStart = HEAP_START;
-  while(inHeapRange(blockStart)){
-    if(blockUsed(blockStart)){
-      stats.wordsAllocated += blockRoom(blockStart);
-      stats.blocksUsed++;
-    }
-    else{
-      stats.wordsAvailable += blockRoom(blockStart);
-      stats.blocksUnused++;
-    }
-    blockStart = nextBlockHeader(blockStart);
-  }
-  stats.wordsOverhead = HEAP_SIZE_WORDS - stats.wordsAllocated - stats.wordsAvailable;
-  return stats;
+// input: reference to a heap_stats_t that returns the current usage of the heap
+// output: 0 in case of success, non-zeror in case of error (e.g. corrupted heap)
+int Heap2_Stats(heap_stats_t *stats){
+	stats->free = stats_local.free;
+	stats->size = stats_local.size;
+	stats->used = stats_local.used;
+  return 0;   // replace
 }
-
-
-// inHeapRange
-// input: a pointer
-// output: whether or not the pointer points inside the heap
-static int32_t inHeapRange(int32_t* address){
-  return address >= HEAP_START && address < HEAP_END;
-}
-
-
-// blockUsed
-// input: pointer to the header or trailer of a block
-// output: whether or not the block is marked as used/allocated
-static int32_t blockUsed(int32_t* block){
-  return *block > 0;
-}
-
-
-// blockUnused
-// input: pointer to the header or trailer of a block
-// output: whether or not the block is marked as unused/unallocated
-static int32_t blockUnused(int32_t* block){
-  return *block < 0;
-}
-
-
-// blockRoom
-// input: pointer to the header or trailer of a block
-// output: how many words of data the block can hold
-static int32_t blockRoom(int32_t* block){
-  if(*block > 0){
-    return *block;
-  }
-  return -*block;
-}
-
-
-// // blockSize
-// // input: pointer to the header or trailer of a block
-// // output: the size of a block in words, including header and trailer
-// static int32_t blockSize(int32_t* block){
-//   if(*block > 0){
-//     return *block + 2;
-//   }
-//   return -*block + 2;
-// }
-
-
-// blockHeader
-// input: pointer to the trailer of a block
-// output: pointer to the header of the same block
-static int32_t* blockHeader(int32_t* blockEnd){
-  return blockEnd - blockRoom(blockEnd) - 1;
-}
-
-
-// blockTrailer
-// input: pointer to the header of a block
-// output: pointer to the trailer of the same block
-static int32_t* blockTrailer(int32_t* blockStart){
-  return blockStart + blockRoom(blockStart) + 1;
-}
-
-
-// nextBlockHeader
-// input: pointer to the header of a block
-// output: pointer the the header of the next block in the heap
-// notes: given the header of the last block in the heap, will point to HEAP_END,
-//   which is not a valid block; be careful
-static int32_t* nextBlockHeader(int32_t* blockStart){
-  return blockTrailer(blockStart) + 1;
-}
-
-
-// previousBlockHeader
-// input: pointer to the header of a block
-// output: pointer the the header of the previous block in the heap
-// notes: given the header of the first block in the heap, this function
-//   will go crazy and return a proportionally crazy address!
-static int32_t* previousBlockHeader(int32_t* blockStart){
-  return blockHeader(blockStart - 1);
-}
-
-
-// markBlockUsed
-// input: pointer to the header of a block
-// output: a heap flag - HEAP_OK if everything is ok or HEAP_ERROR_CORRUPTEDHEAP
-//   if there is something obviously wrong with the block
-//notes: marks the block as used/allocated
-static int32_t markBlockUsed(int32_t* blockStart){
-  int32_t* blockEnd = blockTrailer(blockStart);
-  if(blockUsed(blockStart) || *blockStart != *blockEnd){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-  *blockStart = -*blockStart;
-  *blockEnd = -*blockEnd;
-  return HEAP_OK;
-}
-
-
-// markBlockUnused
-// input: pointer to the header of a block
-// output: a heap flag - HEAP_OK if everything is ok or HEAP_ERROR_CORRUPTEDHEAP
-//  if there is something obviously wrong with the block
-// notes: marks the block as unused/unallocated
-static int32_t markBlockUnused(int32_t* blockStart){
-  int32_t* blockEnd = blockTrailer(blockStart);
-  if(blockUnused(blockStart) || *blockStart != *blockEnd){
-    return HEAP_ERROR_CORRUPTED_HEAP;
-  }
-  *blockStart = -*blockStart;
-  *blockEnd = -*blockEnd;
-  return HEAP_OK;
-}
-
-
-// splitAndMarkBlockUsed
-// input: 
-//  uppterBlockStart: header of a block 
-//  desiredRoom: desired amount of words to be in the new upper block
-// output: none
-// notes: splits the block given so that the new upper block holds desiredRoom
-//  words (or more).  Marks the upper block as used, lower block as unused.
-//  Will not split a block if the leftover room is insufficient to make another
-//  useful block.
-static int32_t splitAndMarkBlockUsed(int32_t* upperBlockStart, int32_t desiredRoom){
-  int32_t leftoverRoom = blockRoom(upperBlockStart) - desiredRoom - 2;
-  // only split block if leftovers could actually make another useful block
-  if(leftoverRoom > 0){
-    int32_t* upperBlockEnd = upperBlockStart + desiredRoom + 1;
-    int32_t* lowerBlockStart = upperBlockEnd + 1;
-    int32_t* lowerBlockEnd = blockTrailer(upperBlockStart);
-    *upperBlockStart = desiredRoom; // marked used
-    *upperBlockEnd = desiredRoom;
-    *lowerBlockStart = -leftoverRoom; // marked unused
-    *lowerBlockEnd = -leftoverRoom;
-  }
-  // can't split block - just mark it at used
-  else{
-    if(markBlockUsed(upperBlockStart)){
-      return 0; // NULL Free failed
-    }
-  }
-  return HEAP_OK;
-}
-
-
-// mergeBlockWithBelow
-// input: pointer to the header of a block
-// output: none
-// notes: will merge the given block with the block below it.
-//  WARNING: Does not check that the block below actually exists.
-static void mergeBlockWithBelow(int32_t* upperBlockStart){
-  int32_t* upperBlockEnd = blockTrailer(upperBlockStart);
-  int32_t* lowerBlockStart = upperBlockEnd + 1;
-  int32_t* lowerBlockEnd = blockTrailer(lowerBlockStart);
-
-  int32_t room = lowerBlockEnd - upperBlockStart - 1;
-  *upperBlockStart = -room;
-  *lowerBlockEnd = -room;
-  return;
-}
-
-#undef HEAP_START
-#undef HEAP_END 
-
-
