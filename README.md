@@ -1,8 +1,6 @@
 # microRTOS
 This repository is to be used as a reference for the RTOS developed by April Douglas and Matija Jankovic for ECE 445M in Spring 2024.
 
-Some files, namely those written for the final project's mini racing car such as sensor drivers and control algorithm, are not included because I do not have the permission to share them publicly.
-
 The repository includes libraries used in the creation and operation of the OS such as the FAT filesystem driver ff.c, SD card driver eDisk.c, and ELF file loader loader.c
 
 ### What is self-written
