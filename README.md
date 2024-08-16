@@ -16,6 +16,6 @@ The repository includes libraries used in the creation and operation of the OS s
 ### What is unmodified and used as a library
 - loader.c (ELF file loader)
 - ff.c (FAT filsystem driver)
-- eDisk.c (SD card driveR)
+- eDisk.c (SD card driver)
 
 
