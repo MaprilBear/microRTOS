@@ -7,6 +7,7 @@ The repository includes libraries used in the creation and operation of the OS s
 
 ### What is self-written
 - OS.c (contains all thread creation, scheduling, FIFO, and other OS code)
+- osasm.s (context switching assembly code and SVC handlers)
 - eFile.c (file layer for user programs to interact with the filesystem)
 - heap.c (basic first-fit heap allocation implementation for OS allocated structures)
 - Jitter.c (used to measure time jitter on a thread)
